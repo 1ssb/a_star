@@ -1,0 +1,17 @@
+# Build artifacts
+*.o
+planner/plan2exec
+planner/waypoint2ctrl
+planner/ctrl_runner
+planner/compile_commands.json
+
+# Generated outputs
+se2_path_floor.txt
+controls.txt
+plan_viz.png
+
+# IDE
+.vscode/
+
+# Archives
+*.zip
