@@ -1,12 +1,15 @@
 [
   {
-    "directory": "/home/rudra/Desktop/a_star",
-    "file": "/home/rudra/Desktop/a_star/pla2exec.cc",
-    "command": "g++ -std=c++17 -Wall -Wextra -Wpedantic -g -c -o pla2exec.o pla2exec.cc"
-  },
-  {
-    "directory": "/home/rudra/Desktop/a_star",
-    "file": "/home/rudra/Desktop/a_star/waypoint2ctrl.cc",
+    "directory": "/home/rudra/Desktop/a_star/planner",
+    "file": "/home/rudra/Desktop/a_star/planner/plan2exec.cc",
+    "command": "g++ -std=c++17 -Wall -Wextra -Wpedantic -g -c -o plan2exec.o plan2exec.cc"
+  },\n  {
+    "directory": "/home/rudra/Desktop/a_star/planner",
+    "file": "/home/rudra/Desktop/a_star/planner/waypoint2ctrl.cc",
     "command": "g++ -std=c++17 -Wall -Wextra -Wpedantic -g -c -o waypoint2ctrl.o waypoint2ctrl.cc"
+  },\n  {
+    "directory": "/home/rudra/Desktop/a_star/planner",
+    "file": "/home/rudra/Desktop/a_star/planner/ctrl_runner.cc",
+    "command": "g++ -std=c++17 -Wall -Wextra -Wpedantic -g -c -o ctrl_runner.o ctrl_runner.cc"
   }
 ]

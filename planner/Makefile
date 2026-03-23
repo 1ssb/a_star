@@ -1,36 +1,39 @@
 CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -g
-LDFLAGS  :=
 
-SRCS     := pla2exec.cc waypoint2ctrl.cc
-TARGETS  := pla2exec waypoint2ctrl
+SRCS     := plan2exec.cc waypoint2ctrl.cc ctrl_runner.cc
+TARGETS  := plan2exec waypoint2ctrl ctrl_runner
+OBJS     := $(SRCS:.cc=.o)
 
-.PHONY: all clean compile_commands.json
+.PHONY: all clean
 
 all: $(TARGETS) compile_commands.json
 
-pla2exec: pla2exec.o
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+# ── Link targets ────────────────────────────────────────────
+plan2exec: plan2exec.o
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
 waypoint2ctrl: waypoint2ctrl.o
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
+ctrl_runner: ctrl_runner.o
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+# ── Compile rule ────────────────────────────────────────────
 %.o: %.cc
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
+# ── Auto-generate compile_commands.json for clangd ─────────
 compile_commands.json: $(SRCS)
-	@echo '[' > $@
-	@echo '  {' >> $@
-	@echo '    "directory": "$(CURDIR)",' >> $@
-	@echo '    "file": "$(CURDIR)/pla2exec.cc",' >> $@
-	@echo '    "command": "$(CXX) $(CXXFLAGS) -c -o pla2exec.o pla2exec.cc"' >> $@
-	@echo '  },' >> $@
-	@echo '  {' >> $@
-	@echo '    "directory": "$(CURDIR)",' >> $@
-	@echo '    "file": "$(CURDIR)/waypoint2ctrl.cc",' >> $@
-	@echo '    "command": "$(CXX) $(CXXFLAGS) -c -o waypoint2ctrl.o waypoint2ctrl.cc"' >> $@
-	@echo '  }' >> $@
-	@echo ']' >> $@
+	@printf '[\n' > $@
+	@sep=""; \
+	for src in $(SRCS); do \
+	  printf '%s  {\n    "directory": "%s",\n    "file": "%s/%s",\n    "command": "%s %s -c -o %s %s"\n  }' \
+	    "$$sep" "$(CURDIR)" "$(CURDIR)" "$$src" \
+	    "$(CXX)" "$(CXXFLAGS)" "$${src%.cc}.o" "$$src" >> $@; \
+	  sep=",\n"; \
+	done
+	@printf '\n]\n' >> $@
 
 clean:
-	rm -f pla2exec.o waypoint2ctrl.o $(TARGETS) compile_commands.json
+	rm -f $(OBJS) $(TARGETS) compile_commands.json

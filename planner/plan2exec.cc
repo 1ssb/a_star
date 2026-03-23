@@ -1,4 +1,4 @@
-// pla2exec.cc  —  SE(2) A* planner on a discrete (x, y, θ) grid
+// plan2exec.cc  —  SE(2) A* planner on a discrete (x, y, θ) grid
 //
 // COMPLETE REWRITE — pure grid-based A*.
 //
@@ -24,8 +24,8 @@
 //
 // Config loaded from planner.cfg via planner_config.h.
 //
-// Build:  g++ -std=c++17 -O2 -Wall -o pla2exec pla2exec.cc
-// Run:    ./pla2exec [--config planner.cfg] [--json tf.json]
+// Build:  g++ -std=c++17 -O2 -Wall -o plan2exec plan2exec.cc
+// Run:    ./plan2exec [--config planner.cfg] [--json tf.json]
 
 #include "planner_config.h"
 

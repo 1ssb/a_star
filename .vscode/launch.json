@@ -9,7 +9,7 @@
       "stopAtEntry": false,
       "externalConsole": false,
       "cwd": "/home/rudra/Desktop/a_star",
-      "program": "/home/rudra/Desktop/a_star/pla2exec",
+      "program": "/home/rudra/Desktop/a_star/planner/plan2exec",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "setupCommands": [
