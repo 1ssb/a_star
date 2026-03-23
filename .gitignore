@@ -8,7 +8,6 @@ planner/compile_commands.json
 # Generated outputs
 se2_path_floor.txt
 controls.txt
-plan_viz.png
 
 # IDE
 .vscode/
