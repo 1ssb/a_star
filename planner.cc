@@ -1,0 +1,963 @@
+// planner.cc — Unified SE(2) A* planner + controller + socket visualizer
+//
+// Single file: plans path, generates controls, streams results over TCP
+// socket to visualize.py, and executes controls via SetMotion().
+//
+// Config split:
+//   planner.cfg  — static settings (map, grid, robot, tolerances)
+//   query.cfg    — dynamic settings (start, goal, obstacles) — updated per run
+//
+// Build & run:  make run
+// Build only:   make
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <chrono>
+#include <fstream>
+#include <iostream>
+#include <queue>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+// POSIX sockets
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+// ============================================================
+// SE(2) pose
+// ============================================================
+struct Pose2D
+{
+    double x = 0.0;
+    double y = 0.0;
+    double theta = 0.0;
+};
+
+// ============================================================
+// Rectangular obstacle
+// ============================================================
+struct Obstacle
+{
+    Pose2D pose;
+    double length = 0.355;
+    double width = 0.255;
+};
+
+// ============================================================
+// Full planner configuration
+// ============================================================
+struct PlannerConfig
+{
+    // Map bounds (metres)
+    double x_min = -1.0;
+    double x_max = 1.5;
+    double y_min = -1.0;
+    double y_max = 2.75;
+
+    // Grid resolution
+    double dx = 0.2;
+    double dy = 0.2;
+    int n_theta = 8;
+    double dtheta = 2.0 * M_PI / 8;
+
+    // Goal tolerance (Euclidean, metres)
+    double goal_tol = 0.35;
+
+    // Robot circle radius
+    double robot_radius = 0.25;
+
+    // Obstacles
+    std::vector<Obstacle> obstacles;
+    double safety_margin = 0.02;
+
+    // Poses
+    Pose2D start;
+    Pose2D goal;
+
+    // Post-planning offset
+    double delta_x = 0.0;
+    double delta_y = 0.0;
+    double delta_theta = 0.0;
+
+    // Controller: time per step (seconds) — controls = displacement / step_time
+    // For Go2: large enough that the robot actually walks the full displacement
+    double step_time = 2.0;
+
+    // Socket port for visualizer
+    int viz_port = 9876;
+
+    void refresh_dtheta() { dtheta = 2.0 * M_PI / n_theta; }
+};
+
+// ============================================================
+// Geometry helpers
+// ============================================================
+static inline double wrap_angle(double a)
+{
+    return std::atan2(std::sin(a), std::cos(a));
+}
+
+static inline double hypot2(double dx, double dy)
+{
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+static inline bool point_in_inflated_rect(double px, double py,
+                                          const Obstacle &ob,
+                                          double robot_radius,
+                                          double safety_margin)
+{
+    double total = robot_radius + safety_margin;
+    double dx = px - ob.pose.x;
+    double dy = py - ob.pose.y;
+    double c = std::cos(ob.pose.theta);
+    double s = std::sin(ob.pose.theta);
+    double lx = c * dx + s * dy;
+    double ly = -s * dx + c * dy;
+    return std::fabs(lx) <= (ob.length / 2.0 + total) && std::fabs(ly) <= (ob.width / 2.0 + total);
+}
+
+static inline bool point_hits_any_obstacle(double px, double py,
+                                           const PlannerConfig &cfg)
+{
+    for (const auto &ob : cfg.obstacles)
+        if (point_in_inflated_rect(px, py, ob, cfg.robot_radius, cfg.safety_margin))
+            return true;
+    return false;
+}
+
+// ============================================================
+// Config-file loader (key = value, # comments)
+// ============================================================
+static bool load_config_file(const std::string &path, PlannerConfig &cfg)
+{
+    std::ifstream f(path);
+    if (!f)
+    {
+        std::cerr << "Cannot open config: " << path << "\n";
+        return false;
+    }
+
+    auto trim = [](std::string &s)
+    {
+        auto a = s.find_first_not_of(" \t\r\n");
+        auto b = s.find_last_not_of(" \t\r\n");
+        s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+    };
+
+    std::string line;
+    while (std::getline(f, line))
+    {
+        auto sharp = line.find('#');
+        if (sharp != std::string::npos)
+            line.erase(sharp);
+        auto first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos)
+            continue;
+
+        auto eq = line.find('=');
+        if (eq == std::string::npos)
+            continue;
+
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        trim(key);
+        trim(val);
+        if (key.empty() || val.empty())
+            continue;
+
+        try
+        {
+            if (key == "x_min")
+                cfg.x_min = std::stod(val);
+            else if (key == "x_max")
+                cfg.x_max = std::stod(val);
+            else if (key == "y_min")
+                cfg.y_min = std::stod(val);
+            else if (key == "y_max")
+                cfg.y_max = std::stod(val);
+            else if (key == "dx")
+                cfg.dx = std::stod(val);
+            else if (key == "dy")
+                cfg.dy = std::stod(val);
+            else if (key == "n_theta")
+            {
+                cfg.n_theta = std::stoi(val);
+                cfg.refresh_dtheta();
+            }
+            else if (key == "goal_tol")
+                cfg.goal_tol = std::stod(val);
+            else if (key == "robot_radius")
+                cfg.robot_radius = std::stod(val);
+            else if (key == "start_x")
+                cfg.start.x = std::stod(val);
+            else if (key == "start_y")
+                cfg.start.y = std::stod(val);
+            else if (key == "start_theta")
+                cfg.start.theta = std::stod(val);
+            else if (key == "goal_x")
+                cfg.goal.x = std::stod(val);
+            else if (key == "goal_y")
+                cfg.goal.y = std::stod(val);
+            else if (key == "goal_theta")
+                cfg.goal.theta = std::stod(val);
+            else if (key == "safety_margin")
+                cfg.safety_margin = std::stod(val);
+            else if (key == "delta_x")
+                cfg.delta_x = std::stod(val);
+            else if (key == "delta_y")
+                cfg.delta_y = std::stod(val);
+            else if (key == "delta_theta")
+                cfg.delta_theta = std::stod(val);
+            else if (key == "step_time")
+                cfg.step_time = std::stod(val);
+            else if (key == "viz_port")
+                cfg.viz_port = std::stoi(val);
+            else if (key.rfind("obs.", 0) == 0)
+            {
+                auto dot1 = key.find('.', 4);
+                if (dot1 != std::string::npos)
+                {
+                    int idx = std::stoi(key.substr(4, dot1 - 4));
+                    auto fld = key.substr(dot1 + 1);
+                    if (idx < 0)
+                        throw std::runtime_error("negative obstacle index");
+                    auto uidx = static_cast<std::size_t>(idx);
+                    if (uidx >= cfg.obstacles.size())
+                        cfg.obstacles.resize(uidx + 1);
+                    auto &ob = cfg.obstacles[uidx];
+                    if (fld == "x")
+                        ob.pose.x = std::stod(val);
+                    else if (fld == "y")
+                        ob.pose.y = std::stod(val);
+                    else if (fld == "theta")
+                        ob.pose.theta = std::stod(val);
+                    else if (fld == "length")
+                        ob.length = std::stod(val);
+                    else if (fld == "width")
+                        ob.width = std::stod(val);
+                }
+            }
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Config parse error for key '" << key
+                      << "': " << e.what() << "\n";
+        }
+    }
+    return true;
+}
+
+// ============================================================
+// Discrete grid
+// ============================================================
+struct Grid
+{
+    double x_min, y_min;
+    double dx, dy;
+    int NX, NY, NT;
+    double dtheta;
+
+    static constexpr int DIR[8][2] = {
+        {1, 0},
+        {1, 1},
+        {0, 1},
+        {-1, 1},
+        {-1, 0},
+        {-1, -1},
+        {0, -1},
+        {1, -1},
+    };
+    static constexpr double DIR_COST[8] = {
+        1.0,
+        1.41421356,
+        1.0,
+        1.41421356,
+        1.0,
+        1.41421356,
+        1.0,
+        1.41421356,
+    };
+
+    void init(const PlannerConfig &cfg)
+    {
+        x_min = cfg.x_min;
+        y_min = cfg.y_min;
+        dx = cfg.dx;
+        dy = cfg.dy;
+        NT = cfg.n_theta;
+        dtheta = 2.0 * M_PI / NT;
+        NX = static_cast<int>(std::round((cfg.x_max - cfg.x_min) / dx)) + 1;
+        NY = static_cast<int>(std::round((cfg.y_max - cfg.y_min) / dy)) + 1;
+    }
+
+    double wx(int xi) const { return x_min + xi * dx; }
+    double wy(int yi) const { return y_min + yi * dy; }
+    double wt(int ti) const { return ti * dtheta; }
+
+    int to_xi(double x) const { return static_cast<int>(std::round((x - x_min) / dx)); }
+    int to_yi(double y) const { return static_cast<int>(std::round((y - y_min) / dy)); }
+    int to_ti(double theta) const
+    {
+        double t = wrap_angle(theta);
+        if (t < 0.0)
+            t += 2.0 * M_PI;
+        int ti = static_cast<int>(std::round(t / dtheta)) % NT;
+        return ti;
+    }
+
+    bool in_bounds(int xi, int yi) const
+    {
+        return xi >= 0 && xi < NX && yi >= 0 && yi < NY;
+    }
+};
+
+// ============================================================
+// Collision checking
+// ============================================================
+static bool is_free(double px, double py, const PlannerConfig &cfg)
+{
+    double r = cfg.robot_radius;
+    if (px - r < cfg.x_min || px + r > cfg.x_max ||
+        py - r < cfg.y_min || py + r > cfg.y_max)
+        return false;
+    return !point_hits_any_obstacle(px, py, cfg);
+}
+
+static bool segment_free(double x0, double y0,
+                         double x1, double y1,
+                         const PlannerConfig &cfg)
+{
+    double d = hypot2(x1 - x0, y1 - y0);
+    int n = std::max(2, static_cast<int>(std::ceil(d / 0.01)));
+    for (int i = 0; i <= n; ++i)
+    {
+        double t = static_cast<double>(i) / n;
+        double px = x0 + t * (x1 - x0);
+        double py = y0 + t * (y1 - y0);
+        if (!is_free(px, py, cfg))
+            return false;
+    }
+    return true;
+}
+
+static double clearance_to_obstacle(double px, double py,
+                                    const Obstacle &ob,
+                                    double robot_radius,
+                                    double safety_margin)
+{
+    double total = robot_radius + safety_margin;
+    double ddx = px - ob.pose.x;
+    double ddy = py - ob.pose.y;
+    double c = std::cos(ob.pose.theta);
+    double s = std::sin(ob.pose.theta);
+    double lx = c * ddx + s * ddy;
+    double ly = -s * ddx + c * ddy;
+    double cx = std::fabs(lx) - (ob.length / 2.0 + total);
+    double cy = std::fabs(ly) - (ob.width / 2.0 + total);
+    return std::max(cx, cy);
+}
+
+// ============================================================
+// A* types
+// ============================================================
+struct State
+{
+    int xi = 0, yi = 0, ti = 0;
+    bool operator==(const State &o) const
+    {
+        return xi == o.xi && yi == o.yi && ti == o.ti;
+    }
+};
+
+struct StateHash
+{
+    std::size_t operator()(const State &s) const
+    {
+        std::size_t h = std::hash<int>()(s.xi);
+        h ^= std::hash<int>()(s.yi) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>()(s.ti) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct Node
+{
+    double f = 0, g = 0;
+    State state;
+    int parent = -1;
+    bool operator>(const Node &o) const { return f > o.f; }
+};
+
+struct PathPoint
+{
+    double x, y, theta;
+};
+
+// ============================================================
+// A* search
+// ============================================================
+static bool run_astar(const PlannerConfig &cfg,
+                      std::vector<PathPoint> &out_path)
+{
+    Grid grid;
+    grid.init(cfg);
+
+    std::printf("  Grid dims  : NX=%d  NY=%d  NT=%d\n", grid.NX, grid.NY, grid.NT);
+
+    State start_s{grid.to_xi(cfg.start.x), grid.to_yi(cfg.start.y),
+                  grid.to_ti(cfg.start.theta)};
+    State goal_s{grid.to_xi(cfg.goal.x), grid.to_yi(cfg.goal.y),
+                 grid.to_ti(cfg.goal.theta)};
+
+    double sx = grid.wx(start_s.xi), sy = grid.wy(start_s.yi);
+    double gx = grid.wx(goal_s.xi), gy = grid.wy(goal_s.yi);
+
+    std::printf("  Grid start : (%d, %d, %d) -> (%.3f, %.3f, %.3f)\n",
+                start_s.xi, start_s.yi, start_s.ti, sx, sy, grid.wt(start_s.ti));
+    std::printf("  Grid goal  : (%d, %d, %d) -> (%.3f, %.3f, %.3f)\n",
+                goal_s.xi, goal_s.yi, goal_s.ti, gx, gy, grid.wt(goal_s.ti));
+
+    if (!grid.in_bounds(start_s.xi, start_s.yi))
+    {
+        std::cerr << "ERROR: start is outside grid.\n";
+        return false;
+    }
+    if (!is_free(sx, sy, cfg))
+    {
+        std::cerr << "ERROR: start (" << sx << ", " << sy
+                  << ") is in collision or outside map.\n";
+        for (std::size_t i = 0; i < cfg.obstacles.size(); ++i)
+        {
+            double cl = clearance_to_obstacle(sx, sy, cfg.obstacles[i],
+                                              cfg.robot_radius, cfg.safety_margin);
+            std::cerr << "  obs[" << i << "] clearance = " << cl << " m\n";
+        }
+        return false;
+    }
+    if (!grid.in_bounds(goal_s.xi, goal_s.yi))
+    {
+        std::cerr << "ERROR: goal is outside grid.\n";
+        return false;
+    }
+    if (!is_free(gx, gy, cfg))
+    {
+        std::cerr << "ERROR: goal (" << gx << ", " << gy
+                  << ") is in collision or outside map.\n";
+        for (std::size_t i = 0; i < cfg.obstacles.size(); ++i)
+        {
+            double cl = clearance_to_obstacle(gx, gy, cfg.obstacles[i],
+                                              cfg.robot_radius, cfg.safety_margin);
+            std::cerr << "  obs[" << i << "] clearance = " << cl << " m\n";
+        }
+        return false;
+    }
+
+    std::vector<Node> closed;
+    closed.reserve(100000);
+
+    using PQ = std::priority_queue<Node, std::vector<Node>, std::greater<Node> >;
+    PQ open;
+    std::unordered_map<State, double, StateHash> best;
+
+    double h0 = hypot2(sx - gx, sy - gy);
+    Node sn{};
+    sn.f = h0;
+    sn.g = 0.0;
+    sn.state = start_s;
+    sn.parent = -1;
+
+    open.push(sn);
+    best[start_s] = 0.0;
+
+    double goal_tol_sq = cfg.goal_tol * cfg.goal_tol;
+    int expanded = 0, generated = 0;
+
+    while (!open.empty())
+    {
+        Node cur = open.top();
+        open.pop();
+
+        auto it = best.find(cur.state);
+        if (it != best.end() && cur.g > it->second + 1e-9)
+            continue;
+
+        int ci = static_cast<int>(closed.size());
+        closed.push_back(cur);
+        ++expanded;
+
+        double cur_wx = grid.wx(cur.state.xi);
+        double cur_wy = grid.wy(cur.state.yi);
+
+        double ddx = cur_wx - gx;
+        double ddy = cur_wy - gy;
+        if (ddx * ddx + ddy * ddy <= goal_tol_sq)
+        {
+            std::vector<PathPoint> path;
+            int pidx = ci;
+            while (pidx >= 0)
+            {
+                const Node &n = closed[static_cast<std::size_t>(pidx)];
+                path.push_back({grid.wx(n.state.xi),
+                                grid.wy(n.state.yi),
+                                grid.wt(n.state.ti)});
+                pidx = n.parent;
+            }
+            std::reverse(path.begin(), path.end());
+            out_path = std::move(path);
+            std::printf("Path found: %zu waypoints (expanded=%d, generated=%d)\n",
+                        out_path.size(), expanded, generated);
+            return true;
+        }
+
+        int di = Grid::DIR[cur.state.ti][0];
+        int dj = Grid::DIR[cur.state.ti][1];
+        double step_cost = Grid::DIR_COST[cur.state.ti] * std::min(cfg.dx, cfg.dy);
+
+        int nxi = cur.state.xi + di;
+        int nyi = cur.state.yi + dj;
+
+        if (!grid.in_bounds(nxi, nyi))
+            continue;
+
+        double nwx = grid.wx(nxi);
+        double nwy = grid.wy(nyi);
+
+        if (!is_free(nwx, nwy, cfg))
+            continue;
+        if (!segment_free(cur_wx, cur_wy, nwx, nwy, cfg))
+            continue;
+
+        int headings[3] = {
+            cur.state.ti,
+            (cur.state.ti + 1) % grid.NT,
+            ((cur.state.ti - 1) + grid.NT) % grid.NT,
+        };
+        double costs[3] = {step_cost, step_cost * 1.2, step_cost * 1.2};
+
+        for (int p = 0; p < 3; ++p)
+        {
+            State ns{nxi, nyi, headings[p]};
+            double ng = cur.g + costs[p];
+
+            auto bit = best.find(ns);
+            if (bit != best.end() && bit->second <= ng)
+                continue;
+            best[ns] = ng;
+
+            double nh = hypot2(nwx - gx, nwy - gy);
+            Node nb{};
+            nb.f = ng + nh;
+            nb.g = ng;
+            nb.state = ns;
+            nb.parent = ci;
+            open.push(nb);
+            ++generated;
+        }
+    }
+
+    std::printf("No path found. (expanded=%d, generated=%d)\n", expanded, generated);
+    return false;
+}
+
+// ============================================================
+// Apply post-planning offset
+// ============================================================
+static void apply_offset(std::vector<PathPoint> &path,
+                         const PlannerConfig &cfg)
+{
+    if (cfg.delta_x == 0.0 && cfg.delta_y == 0.0 && cfg.delta_theta == 0.0)
+        return;
+    for (auto &p : path)
+    {
+        p.x += cfg.delta_x;
+        p.y += cfg.delta_y;
+        p.theta = wrap_angle(p.theta + cfg.delta_theta);
+    }
+}
+
+// ============================================================
+// Controller: waypoints -> velocity commands for Go2
+//
+// Each segment produces (vx, vy, vtheta) as velocities:
+//   vx     = forward speed along heading (m/s)
+//   vy     = lateral speed (always 0, unicycle)
+//   vtheta = angular velocity (rad/s)
+//
+// The robot drives each command for step_time seconds.
+// Displacements are real world-frame distances between waypoints,
+// projected into body frame. This ensures the Go2 actually walks
+// to each waypoint rather than making micro-adjustments.
+// ============================================================
+struct ControlCmd
+{
+    double vx;       // forward velocity (m/s)
+    double vy;       // lateral velocity (m/s) — always 0
+    double vtheta;   // angular velocity (rad/s)
+    double duration; // how long to hold this command (s)
+};
+
+static std::vector<ControlCmd> compute_controls(
+    const std::vector<PathPoint> &path,
+    double step_time)
+{
+    std::vector<ControlCmd> cmds;
+    if (path.size() < 2)
+        return cmds;
+
+    for (std::size_t i = 1; i < path.size(); ++i)
+    {
+        const auto &prev = path[i - 1];
+        const auto &next = path[i];
+
+        double dx_w = next.x - prev.x;
+        double dy_w = next.y - prev.y;
+        double dtheta = wrap_angle(next.theta - prev.theta);
+
+        // World-frame displacement magnitude
+        double dist = hypot2(dx_w, dy_w);
+
+        // Body-frame forward displacement: project onto heading
+        double fwd = dx_w * std::cos(prev.theta) + dy_w * std::sin(prev.theta);
+
+        // Use the full Euclidean distance with the sign of the projection
+        // so the robot always covers the real distance
+        double displacement = (fwd >= 0.0) ? dist : -dist;
+
+        ControlCmd cmd;
+        cmd.vx = displacement / step_time; // m/s
+        cmd.vy = 0.0;
+        cmd.vtheta = dtheta / step_time; // rad/s
+        cmd.duration = step_time;
+        cmds.push_back(cmd);
+    }
+    return cmds;
+}
+
+// ============================================================
+// SetMotion stub — replace with Go2 SDK call
+// ============================================================
+static void SetMotion(double vx, double vy, double vtheta)
+{
+    std::printf("  SetMotion(vx=%.4f m/s, vy=%.4f m/s, vtheta=%.4f rad/s)\n",
+                vx, vy, vtheta);
+}
+
+// ============================================================
+// Execute controls on Go2
+// ============================================================
+static void execute_controls(const std::vector<ControlCmd> &cmds)
+{
+    std::printf("\n=== Executing %zu control commands ===\n", cmds.size());
+    for (std::size_t i = 0; i < cmds.size(); ++i)
+    {
+        const auto &c = cmds[i];
+        std::printf("[step %zu / %zu]  duration=%.1fs\n", i + 1, cmds.size(), c.duration);
+        SetMotion(c.vx, c.vy, c.vtheta);
+
+        // Hold command for duration
+        auto ms = static_cast<int>(c.duration * 1000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }
+    // Stop
+    std::printf("[done] stopping robot\n");
+    SetMotion(0.0, 0.0, 0.0);
+}
+
+// ============================================================
+// Safety audit
+// ============================================================
+static void audit_path(const std::vector<PathPoint> &path,
+                       const PlannerConfig &cfg)
+{
+    std::printf("\nPath safety audit:\n");
+    std::printf("  %-4s  %-8s %-8s  ", "WP", "x", "y");
+    for (std::size_t j = 0; j < cfg.obstacles.size(); ++j)
+        std::printf("obs[%zu] clr  ", j);
+    std::printf("map_clr\n");
+
+    bool any_violation = false;
+    for (std::size_t i = 0; i < path.size(); ++i)
+    {
+        double px = path[i].x, py = path[i].y;
+        std::printf("  %-4zu  %7.3f  %7.3f  ", i, px, py);
+        for (std::size_t j = 0; j < cfg.obstacles.size(); ++j)
+        {
+            double cl = clearance_to_obstacle(px, py, cfg.obstacles[j],
+                                              cfg.robot_radius, cfg.safety_margin);
+            std::printf("  %+.4f    ", cl);
+            if (cl < -1e-6)
+                any_violation = true;
+        }
+        double map_cl = std::min({px - cfg.robot_radius - cfg.x_min,
+                                  cfg.x_max - px - cfg.robot_radius,
+                                  py - cfg.robot_radius - cfg.y_min,
+                                  cfg.y_max - py - cfg.robot_radius});
+        std::printf("  %+.4f", map_cl);
+        if (map_cl < -1e-6)
+            any_violation = true;
+        std::printf("\n");
+    }
+    if (any_violation)
+        std::printf("  *** WARNING: path has safety violations! ***\n");
+    else
+        std::printf("  All waypoints have positive clearance.\n");
+}
+
+// ============================================================
+// Build JSON payload for visualizer socket
+// ============================================================
+static std::string build_viz_json(const PlannerConfig &cfg,
+                                  const std::vector<PathPoint> &path,
+                                  const std::vector<ControlCmd> &cmds)
+{
+    std::ostringstream js;
+    js.precision(6);
+    js << std::fixed;
+
+    js << "{";
+
+    // Config
+    js << "\"config\":{";
+    js << "\"x_min\":" << cfg.x_min << ",";
+    js << "\"x_max\":" << cfg.x_max << ",";
+    js << "\"y_min\":" << cfg.y_min << ",";
+    js << "\"y_max\":" << cfg.y_max << ",";
+    js << "\"robot_radius\":" << cfg.robot_radius << ",";
+    js << "\"safety_margin\":" << cfg.safety_margin << ",";
+    js << "\"start_x\":" << cfg.start.x << ",";
+    js << "\"start_y\":" << cfg.start.y << ",";
+    js << "\"start_theta\":" << cfg.start.theta << ",";
+    js << "\"goal_x\":" << cfg.goal.x << ",";
+    js << "\"goal_y\":" << cfg.goal.y << ",";
+    js << "\"goal_theta\":" << cfg.goal.theta;
+    js << "},";
+
+    // Obstacles
+    js << "\"obstacles\":[";
+    for (std::size_t i = 0; i < cfg.obstacles.size(); ++i)
+    {
+        const auto &ob = cfg.obstacles[i];
+        if (i > 0)
+            js << ",";
+        js << "{\"x\":" << ob.pose.x
+           << ",\"y\":" << ob.pose.y
+           << ",\"theta\":" << ob.pose.theta
+           << ",\"length\":" << ob.length
+           << ",\"width\":" << ob.width << "}";
+    }
+    js << "],";
+
+    // Waypoints
+    js << "\"waypoints\":[";
+    for (std::size_t i = 0; i < path.size(); ++i)
+    {
+        if (i > 0)
+            js << ",";
+        js << "[" << path[i].x << "," << path[i].y << "," << path[i].theta << "]";
+    }
+    js << "],";
+
+    // Controls
+    js << "\"controls\":[";
+    for (std::size_t i = 0; i < cmds.size(); ++i)
+    {
+        if (i > 0)
+            js << ",";
+        js << "[" << cmds[i].vx << "," << cmds[i].vy << ","
+           << cmds[i].vtheta << "," << cmds[i].duration << "]";
+    }
+    js << "]";
+
+    js << "}";
+    return js.str();
+}
+
+// ============================================================
+// Send results to visualizer over TCP socket
+// ============================================================
+static bool send_to_visualizer(const std::string &json, int port)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0)
+    {
+        std::perror("socket");
+        return false;
+    }
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    // Retry connection a few times (visualizer may still be starting)
+    bool connected = false;
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        if (connect(sock, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0)
+        {
+            connected = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+
+    if (!connected)
+    {
+        std::cerr << "WARNING: could not connect to visualizer on port " << port << "\n";
+        close(sock);
+        return false;
+    }
+
+    // Send length-prefixed message: 4 bytes big-endian length + JSON
+    uint32_t len = static_cast<uint32_t>(json.size());
+    uint32_t net_len = htonl(len);
+    ssize_t sent = 0;
+    sent = write(sock, &net_len, 4);
+    if (sent != 4)
+    {
+        close(sock);
+        return false;
+    }
+
+    std::size_t total = 0;
+    while (total < json.size())
+    {
+        sent = write(sock, json.data() + total, json.size() - total);
+        if (sent <= 0)
+        {
+            close(sock);
+            return false;
+        }
+        total += static_cast<std::size_t>(sent);
+    }
+
+    close(sock);
+    std::printf("Sent %zu bytes to visualizer on port %d\n", json.size(), port);
+    return true;
+}
+
+// ============================================================
+// main
+// ============================================================
+int main(int argc, char *argv[])
+{
+    PlannerConfig cfg;
+
+    // Default config file paths (root of workspace)
+    std::string static_cfg = "planner.cfg";
+    std::string dynamic_cfg = "query.cfg";
+    bool do_execute = false;
+    bool do_viz = true;
+
+    // Parse CLI
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc)
+            static_cfg = argv[++i];
+        else if (std::strcmp(argv[i], "--query") == 0 && i + 1 < argc)
+            dynamic_cfg = argv[++i];
+        else if (std::strcmp(argv[i], "--execute") == 0)
+            do_execute = true;
+        else if (std::strcmp(argv[i], "--no-viz") == 0)
+            do_viz = false;
+        else if (std::strcmp(argv[i], "-h") == 0 ||
+                 std::strcmp(argv[i], "--help") == 0)
+        {
+            std::printf(
+                "Usage: %s [options]\n"
+                "  --config <path>   Static config  (default: planner.cfg)\n"
+                "  --query  <path>   Dynamic config  (default: query.cfg)\n"
+                "  --execute         Execute controls via SetMotion()\n"
+                "  --no-viz          Skip visualizer socket\n"
+                "  -h, --help        This message\n",
+                argv[0]);
+            return 0;
+        }
+    }
+
+    // Load static config first, then dynamic config overlays
+    std::printf("Loading static config:  %s\n", static_cfg.c_str());
+    if (!load_config_file(static_cfg, cfg))
+    {
+        std::cerr << "ERROR: cannot load static config.\n";
+        return 1;
+    }
+    std::printf("Loading dynamic config: %s\n", dynamic_cfg.c_str());
+    if (!load_config_file(dynamic_cfg, cfg))
+    {
+        std::cerr << "ERROR: cannot load dynamic config.\n";
+        return 1;
+    }
+
+    cfg.start.theta = wrap_angle(cfg.start.theta);
+    cfg.goal.theta = wrap_angle(cfg.goal.theta);
+
+    // Print configuration
+    std::printf("\n=== SE(2) A* Planner ===\n");
+    std::printf("  Start      : (%.3f, %.3f, %.3f)\n",
+                cfg.start.x, cfg.start.y, cfg.start.theta);
+    std::printf("  Goal       : (%.3f, %.3f, %.3f)\n",
+                cfg.goal.x, cfg.goal.y, cfg.goal.theta);
+    std::printf("  Robot R    : %.3f m\n", cfg.robot_radius);
+    std::printf("  Safety     : %.3f m\n", cfg.safety_margin);
+    std::printf("  Inflation  : %.3f m\n", cfg.robot_radius + cfg.safety_margin);
+    std::printf("  Step time  : %.1f s (Go2 velocity commands)\n", cfg.step_time);
+    std::printf("  Obstacles  : %zu\n", cfg.obstacles.size());
+    for (std::size_t i = 0; i < cfg.obstacles.size(); ++i)
+    {
+        const auto &ob = cfg.obstacles[i];
+        std::printf("    [%zu] centre=(%.3f, %.3f) th=%.3f  L=%.3f W=%.3f\n",
+                    i, ob.pose.x, ob.pose.y, ob.pose.theta,
+                    ob.length, ob.width);
+    }
+    std::printf("  Map        : X[%.1f, %.1f]  Y[%.1f, %.1f]\n",
+                cfg.x_min, cfg.x_max, cfg.y_min, cfg.y_max);
+    std::printf("  Grid       : dx=%.2f  dy=%.2f  n_theta=%d\n\n",
+                cfg.dx, cfg.dy, cfg.n_theta);
+
+    // ── Plan ──
+    std::vector<PathPoint> path;
+    if (!run_astar(cfg, path))
+        return 1;
+
+    apply_offset(path, cfg);
+    audit_path(path, cfg);
+
+    // ── Controls ──
+    auto cmds = compute_controls(path, cfg.step_time);
+
+    std::printf("\n=== Controls (%zu commands, step_time=%.1fs) ===\n",
+                cmds.size(), cfg.step_time);
+    std::printf("  %-4s  %10s  %10s  %10s  %8s\n",
+                "Seg", "vx(m/s)", "vy(m/s)", "vth(rad/s)", "dur(s)");
+    for (std::size_t i = 0; i < cmds.size(); ++i)
+    {
+        std::printf("  %-4zu  %10.4f  %10.4f  %10.4f  %8.1f\n",
+                    i, cmds[i].vx, cmds[i].vy, cmds[i].vtheta, cmds[i].duration);
+    }
+
+    // ── Visualize ──
+    if (do_viz)
+    {
+        std::string json = build_viz_json(cfg, path, cmds);
+        send_to_visualizer(json, cfg.viz_port);
+    }
+
+    // ── Execute ──
+    if (do_execute)
+    {
+        execute_controls(cmds);
+    }
+
+    return 0;
+}
