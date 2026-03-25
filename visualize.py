@@ -29,8 +29,8 @@ import matplotlib.transforms as mtransforms
 import numpy as np
 
 
-def parse_cfg(path: str) -> dict:
-    """Parse a key=value config file (same format as planner.cfg / query.cfg)."""
+def parse_planner_cfg(path: str) -> dict:
+    """Parse planner.cfg: scalar settings + obstacle dimensions (length, width)."""
     cfg = {}
     obstacles = {}
     with open(path) as f:
@@ -54,7 +54,6 @@ def parse_cfg(path: str) -> dict:
                     cfg[key] = float(val)
                 except ValueError:
                     cfg[key] = val
-    # Convert obstacles dict to sorted list
     if obstacles:
         max_idx = max(obstacles.keys())
         obs_list = []
@@ -62,11 +61,50 @@ def parse_cfg(path: str) -> dict:
             if i in obstacles:
                 ob = obstacles[i]
                 obs_list.append({
-                    "x": ob.get("x", 0.0),
-                    "y": ob.get("y", 0.0),
-                    "theta": ob.get("theta", 0.0),
-                    "length": ob.get("length", 0.35),
-                    "width": ob.get("width", 0.25),
+                    "length": ob.get("length"),
+                    "width": ob.get("width"),
+                })
+        cfg["_obstacles"] = obs_list
+    else:
+        cfg["_obstacles"] = []
+    return cfg
+
+
+def parse_query_cfg(path: str) -> dict:
+    """Parse query.cfg: start/goal poses + obstacle poses (x, y, theta)."""
+    cfg = {}
+    obstacles = {}
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if key.startswith("obs."):
+                parts = key.split(".")
+                if len(parts) == 3:
+                    idx = int(parts[1])
+                    field = parts[2]
+                    if idx not in obstacles:
+                        obstacles[idx] = {}
+                    obstacles[idx][field] = float(val)
+            else:
+                try:
+                    cfg[key] = float(val)
+                except ValueError:
+                    cfg[key] = val
+    if obstacles:
+        max_idx = max(obstacles.keys())
+        obs_list = []
+        for i in range(max_idx + 1):
+            if i in obstacles:
+                ob = obstacles[i]
+                obs_list.append({
+                    "x": ob.get("x"),
+                    "y": ob.get("y"),
+                    "theta": ob.get("theta"),
                 })
         cfg["_obstacles"] = obs_list
     else:
@@ -141,7 +179,7 @@ def draw_panel(ax, title, cfg, obstacles, wp, robot_r, safety):
             linewidth=1.2, edgecolor="red", facecolor="salmon",
             alpha=0.5, label=f"Obs {i}")
         ax.add_patch(r_true)
-        inf = robot_r + safety
+        inf = safety
         r_inf = patches.Rectangle(
             (cx - ol / 2 - inf, cy - ow / 2 - inf),
             ol + 2 * inf, ow + 2 * inf, transform=t,
@@ -149,28 +187,22 @@ def draw_panel(ax, title, cfg, obstacles, wp, robot_r, safety):
             linestyle=":", alpha=0.7)
         ax.add_patch(r_inf)
 
-    # Start marker
-    s_al = robot_r * 0.9
-    sx, sy, st = wp[0]
-    ax.add_patch(plt.Circle((sx, sy), robot_r, fill=False,
-                             edgecolor="green", linewidth=1.8, zorder=5))
-    ax.annotate("", xy=(sx + s_al * math.cos(st), sy + s_al * math.sin(st)),
-                xytext=(sx, sy),
-                arrowprops=dict(arrowstyle="-|>", color="green",
-                                lw=2.0, mutation_scale=12), zorder=6)
+    # Query start — point + label
+    sx = cfg["start_x"]
+    sy = cfg["start_y"]
+    ax.plot(sx, sy, "o", color="cyan", markersize=6, zorder=7)
     ax.annotate("START", (sx, sy), textcoords="offset points",
-                xytext=(8, 8), fontsize=8, color="green", fontweight="bold")
+                xytext=(8, 8), fontsize=8, color="cyan", fontweight="bold")
 
-    # Goal marker
-    gx, gy, gt = wp[-1]
-    ax.add_patch(plt.Circle((gx, gy), robot_r, fill=False,
-                             edgecolor="red", linewidth=1.8, zorder=5))
-    ax.annotate("", xy=(gx + s_al * math.cos(gt), gy + s_al * math.sin(gt)),
-                xytext=(gx, gy),
-                arrowprops=dict(arrowstyle="-|>", color="red",
-                                lw=2.0, mutation_scale=12), zorder=6)
+    # Query goal — tolerance circle + point + label
+    gx = cfg["goal_x"]
+    gy = cfg["goal_y"]
+    ax.add_patch(patches.Circle((gx, gy), cfg["goal_tol"], fill=False,
+                                edgecolor="darkred", linewidth=1.2,
+                                linestyle="--", alpha=0.7, zorder=6))
+    ax.plot(gx, gy, "o", color="darkred", markersize=6, zorder=7)
     ax.annotate("GOAL", (gx, gy), textcoords="offset points",
-                xytext=(8, 8), fontsize=8, color="red", fontweight="bold")
+                xytext=(8, 8), fontsize=8, color="darkred", fontweight="bold")
 
 
 def main():
@@ -199,25 +231,36 @@ def main():
         else:
             i += 1
 
-    # Load configs (query overlays planner, same as C++ side)
-    cfg = parse_cfg(config_path)
-    obstacles = cfg.pop("_obstacles", [])
-    query = parse_cfg(query_path)
-    # Query may also define obstacles (gallery test configs)
-    query_obs = query.pop("_obstacles", [])
-    if query_obs:
-        obstacles = query_obs
-    cfg.update(query)
+    # Load configs: planner (dimensions) + query (poses) merged
+    cfg = parse_planner_cfg(config_path)
+    query = parse_query_cfg(query_path)
+
+    for key in query:
+        if key != "_obstacles":
+            cfg[key] = query[key]
+    new_obs = []
+    for i in range(len(cfg["_obstacles"])):
+        obp = cfg["_obstacles"][i]
+        obq = query["_obstacles"][i]
+        obunion = dict()
+        for key in obp.keys():
+            obunion[key] = obp[key]
+        for key in obq.keys():
+            obunion[key] = obq[key]
+        new_obs.append(obunion)
+    cfg["_obstacles"] = new_obs
+
+    obstacles = cfg["_obstacles"]
 
     robot_r = cfg["robot_radius"]
     safety = cfg["safety_margin"]
+
     arrow_len = robot_r * 0.6
     step_time = cfg.get("step_time", 2.0)
 
     # Load data files
     wp = load_waypoints(waypoints_path)
     raw_ctrls = load_controls(controls_path)
-    # Add duration from config
     ctrls = [(vx, vy, vth, step_time) for vx, vy, vth in raw_ctrls]
 
     # ── Figure ──
@@ -237,12 +280,11 @@ def main():
         ax1.annotate("", xy=(x + dx, y + dy), xytext=(x, y),
                       arrowprops=dict(arrowstyle="->", color="dodgerblue",
                                       lw=1.4), zorder=5)
-        ax1.add_patch(plt.Circle((x, y), robot_r, fill=False,
-                                  edgecolor="cornflowerblue",
-                                  linewidth=0.6, linestyle="--", alpha=0.35,
-                                  zorder=2))
         ax1.annotate(str(idx), (x, y), textcoords="offset points",
                       xytext=(-6, 6), fontsize=6, color="navy", alpha=0.8)
+        ax1.add_patch(patches.Circle((x, y), robot_r, fill=False,
+                                     edgecolor="green", linewidth=0.8,
+                                     alpha=0.5, zorder=4))
     ax1.legend(loc="upper left", fontsize=8)
 
     # ── Right panel: controller replay ──
@@ -261,8 +303,9 @@ def main():
         traj_y.append(cy)
         ctrl_positions.append((cx, cy, ct))
 
-    ax2.plot(traj_x, traj_y, "m.-", linewidth=1.2, markersize=6,
-             alpha=0.8, label="Controller traj", zorder=3)
+    if len(wp) > 1:
+        ax2.plot(traj_x, traj_y, "m.-", linewidth=1.2, markersize=6,
+                 alpha=0.8, label="Controller traj", zorder=3)
 
     # Translation arrows
     px, py, pt = float(wp[0, 0]), float(wp[0, 1]), float(wp[0, 2])
@@ -271,26 +314,27 @@ def main():
         if abs(fwd) > 1e-6:
             world_dx = fwd * math.cos(pt)
             world_dy = fwd * math.sin(pt)
-            ax2.annotate("", xy=(px + world_dx, py + world_dy), xytext=(px, py),
-                          arrowprops=dict(arrowstyle="-|>", color="purple",
-                                          lw=1.0), zorder=4)
+            if len(wp) > 1:
+                ax2.annotate("", xy=(px + world_dx, py + world_dy), xytext=(px, py),
+                              arrowprops=dict(arrowstyle="-|>", color="purple",
+                                              lw=1.0), zorder=4)
             px += world_dx
             py += world_dy
         pt += vtheta * dur
 
-    # Heading arrows + circles
+    # Heading arrows + robot radius circles
     for idx, (x, y, th) in enumerate(ctrl_positions):
         adx = arrow_len * math.cos(th)
         ady = arrow_len * math.sin(th)
-        ax2.annotate("", xy=(x + adx, y + ady), xytext=(x, y),
-                      arrowprops=dict(arrowstyle="->", color="orchid",
-                                      lw=1.4), zorder=5)
-        ax2.add_patch(plt.Circle((x, y), robot_r, fill=False,
-                                  edgecolor="plum",
-                                  linewidth=0.6, linestyle="--", alpha=0.35,
-                                  zorder=2))
-        ax2.annotate(str(idx), (x, y), textcoords="offset points",
-                      xytext=(-6, 6), fontsize=6, color="purple", alpha=0.7)
+        if len(wp) > 1:
+            ax2.annotate("", xy=(x + adx, y + ady), xytext=(x, y),
+                          arrowprops=dict(arrowstyle="->", color="orchid",
+                                          lw=1.4), zorder=5)
+            ax2.annotate(str(idx), (x, y), textcoords="offset points",
+                          xytext=(-6, 6), fontsize=6, color="purple", alpha=0.7)
+            ax2.add_patch(patches.Circle((x, y), robot_r, fill=False,
+                                         edgecolor="green", linewidth=0.8,
+                                         alpha=0.5, zorder=4))
 
     ax2.legend(loc="upper left", fontsize=8)
 

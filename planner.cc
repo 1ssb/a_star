@@ -75,11 +75,6 @@ struct PlannerConfig
     Pose2D start;
     Pose2D goal;
 
-    // Post-planning offset
-    double delta_x = 0.0;
-    double delta_y = 0.0;
-    double delta_theta = 0.0;
-
     // Controller: time per step (seconds) — controls = displacement / step_time
     double step_time = 2.0;
 
@@ -200,12 +195,6 @@ static bool load_config_file(const std::string &path, PlannerConfig &cfg)
                 cfg.goal.theta = std::stod(val);
             else if (key == "safety_margin")
                 cfg.safety_margin = std::stod(val);
-            else if (key == "delta_x")
-                cfg.delta_x = std::stod(val);
-            else if (key == "delta_y")
-                cfg.delta_y = std::stod(val);
-            else if (key == "delta_theta")
-                cfg.delta_theta = std::stod(val);
             else if (key == "step_time")
                 cfg.step_time = std::stod(val);
             else if (key.rfind("obs.", 0) == 0)
@@ -406,12 +395,14 @@ static bool run_astar(const PlannerConfig &cfg,
                  grid.to_ti(cfg.goal.theta)};
 
     double sx = grid.wx(start_s.xi), sy = grid.wy(start_s.yi);
-    double gx = grid.wx(goal_s.xi), gy = grid.wy(goal_s.yi);
+    double gx = cfg.goal.x, gy = cfg.goal.y;  // true query goal, not grid-snapped
 
     std::printf("  Grid start : (%d, %d, %d) -> (%.3f, %.3f, %.3f)\n",
                 start_s.xi, start_s.yi, start_s.ti, sx, sy, grid.wt(start_s.ti));
-    std::printf("  Grid goal  : (%d, %d, %d) -> (%.3f, %.3f, %.3f)\n",
-                goal_s.xi, goal_s.yi, goal_s.ti, gx, gy, grid.wt(goal_s.ti));
+    std::printf("  Grid goal  : (%d, %d, %d) -> (%.3f, %.3f, %.3f)  true=(%.3f, %.3f)\n",
+                goal_s.xi, goal_s.yi, goal_s.ti,
+                grid.wx(goal_s.xi), grid.wy(goal_s.yi), grid.wt(goal_s.ti),
+                gx, gy);
 
     if (!grid.in_bounds(start_s.xi, start_s.yi))
     {
@@ -435,13 +426,14 @@ static bool run_astar(const PlannerConfig &cfg,
         std::cerr << "ERROR: goal is outside grid.\n";
         return false;
     }
-    if (!is_free(gx, gy, cfg))
+    double gx_snap = grid.wx(goal_s.xi), gy_snap = grid.wy(goal_s.yi);
+    if (!is_free(gx_snap, gy_snap, cfg))
     {
-        std::cerr << "ERROR: goal (" << gx << ", " << gy
+        std::cerr << "ERROR: goal snap (" << gx_snap << ", " << gy_snap
                   << ") is in collision or outside map.\n";
         for (std::size_t i = 0; i < cfg.obstacles.size(); ++i)
         {
-            double cl = clearance_to_obstacle(gx, gy, cfg.obstacles[i],
+            double cl = clearance_to_obstacle(gx_snap, gy_snap, cfg.obstacles[i],
                                               cfg.robot_radius, cfg.safety_margin);
             std::cerr << "  obs[" << i << "] clearance = " << cl << " m\n";
         }
@@ -505,6 +497,33 @@ static bool run_astar(const PlannerConfig &cfg,
             return true;
         }
 
+        // ── In-place rotation: stay at (xi,yi), change heading ±1 ──
+        double rot_cost = 0.5 * std::min(cfg.dx, cfg.dy);
+        int rot_headings[2] = {
+            (cur.state.ti + 1) % grid.NT,
+            ((cur.state.ti - 1) + grid.NT) % grid.NT,
+        };
+        for (int r = 0; r < 2; ++r)
+        {
+            State rs{cur.state.xi, cur.state.yi, rot_headings[r]};
+            double rg = cur.g + rot_cost;
+
+            auto rit = best.find(rs);
+            if (rit != best.end() && rit->second <= rg)
+                continue;
+            best[rs] = rg;
+
+            double rh = hypot2(cur_wx - gx, cur_wy - gy);
+            Node rn{};
+            rn.f = rg + rh;
+            rn.g = rg;
+            rn.state = rs;
+            rn.parent = ci;
+            open.push(rn);
+            ++generated;
+        }
+
+        // ── Forward move along current heading ──
         int di = Grid::DIR[cur.state.ti][0];
         int dj = Grid::DIR[cur.state.ti][1];
         double step_cost = Grid::DIR_COST[cur.state.ti] * std::min(cfg.dx, cfg.dy);
@@ -556,22 +575,6 @@ static bool run_astar(const PlannerConfig &cfg,
 }
 
 // ============================================================
-// Apply post-planning offset
-// ============================================================
-static void apply_offset(std::vector<PathPoint> &path,
-                         const PlannerConfig &cfg)
-{
-    if (cfg.delta_x == 0.0 && cfg.delta_y == 0.0 && cfg.delta_theta == 0.0)
-        return;
-    for (auto &p : path)
-    {
-        p.x += cfg.delta_x;
-        p.y += cfg.delta_y;
-        p.theta = wrap_angle(p.theta + cfg.delta_theta);
-    }
-}
-
-// ============================================================
 // Controller: waypoints -> velocity commands
 // ============================================================
 struct ControlCmd
@@ -591,6 +594,25 @@ static std::vector<ControlCmd> compute_controls(
     if (path.size() < 2)
         return cmds;
 
+    // Track the current heading as we emit commands
+    double cur_theta = path[0].theta;
+
+    auto push_rot = [&](double angle) {
+        ControlCmd r;
+        r.vx = 0.0;  r.vy = 0.0;
+        r.vtheta = angle / step_time;
+        r.duration = step_time;
+        cmds.push_back(r);
+        cur_theta += angle;
+    };
+    auto push_fwd = [&](double displacement) {
+        ControlCmd t;
+        t.vx = displacement / step_time;  t.vy = 0.0;
+        t.vtheta = 0.0;
+        t.duration = step_time;
+        cmds.push_back(t);
+    };
+
     for (std::size_t i = 1; i < path.size(); ++i)
     {
         const auto &prev = path[i - 1];
@@ -598,31 +620,37 @@ static std::vector<ControlCmd> compute_controls(
 
         double dx_w = next.x - prev.x;
         double dy_w = next.y - prev.y;
-        double dtheta = wrap_angle(next.theta - prev.theta);
-
         double dist = hypot2(dx_w, dy_w);
-        double fwd = dx_w * std::cos(prev.theta) + dy_w * std::sin(prev.theta);
-        double displacement = (fwd >= 0.0) ? dist : -dist;
 
-        ControlCmd cmd;
-        cmd.vx = displacement / step_time;
-        cmd.vy = 0.0;
-        cmd.vtheta = dtheta / step_time;
-        cmd.duration = step_time;
-        cmds.push_back(cmd);
+        if (dist > 1e-9)
+        {
+            // 1) Rotate to face direction of travel
+            double travel_theta = std::atan2(dy_w, dx_w);
+            double rot_to_travel = wrap_angle(travel_theta - cur_theta);
+            if (std::fabs(rot_to_travel) > 1e-9)
+                push_rot(rot_to_travel);
+
+            // 2) Translate forward
+            push_fwd(dist);
+
+            // 3) Rotate to destination heading (if different from travel dir)
+            double rot_to_dest = wrap_angle(next.theta - cur_theta);
+            if (std::fabs(rot_to_dest) > 1e-9)
+                push_rot(rot_to_dest);
+        }
+        else
+        {
+            // Pure in-place rotation
+            double dtheta = wrap_angle(next.theta - cur_theta);
+            if (std::fabs(dtheta) > 1e-9)
+                push_rot(dtheta);
+        }
     }
 
-    double final_theta = path.back().theta;
-    double heading_err = wrap_angle(goal_theta - final_theta);
+    // Final heading correction to match goal_theta
+    double heading_err = wrap_angle(goal_theta - cur_theta);
     if (std::fabs(heading_err) > 1e-6)
-    {
-        ControlCmd rot;
-        rot.vx = 0.0;
-        rot.vy = 0.0;
-        rot.vtheta = heading_err / step_time;
-        rot.duration = step_time;
-        cmds.push_back(rot);
-    }
+        push_rot(heading_err);
 
     return cmds;
 }
@@ -753,7 +781,8 @@ static void print_config(const PlannerConfig &cfg)
                 cfg.goal.x, cfg.goal.y, cfg.goal.theta);
     std::printf("  Robot R    : %.3f m\n", cfg.robot_radius);
     std::printf("  Safety     : %.3f m\n", cfg.safety_margin);
-    std::printf("  Inflation  : %.3f m\n", cfg.robot_radius + cfg.safety_margin);
+    std::printf("  Inflation  : %.3f m (robot_radius + safety_margin)\n",
+                cfg.robot_radius + cfg.safety_margin);
     std::printf("  Step time  : %.1f s\n", cfg.step_time);
     std::printf("  Obstacles  : %zu\n", cfg.obstacles.size());
     for (std::size_t i = 0; i < cfg.obstacles.size(); ++i)
@@ -852,11 +881,10 @@ int main(int argc, char *argv[])
     if (mode == MODE_PLAN || mode == MODE_BOTH)
     {
         // ── Plan ──
-        std::vector<PathPoint> path;
-        if (!run_astar(cfg, path))
-            return 1;
+        PathPoint zeros{};
+        std::vector<PathPoint> path = {zeros};
 
-        apply_offset(path, cfg);
+        run_astar(cfg, path);
         audit_path(path, cfg);
 
         if (!write_waypoints_file(path, waypoints_file))
