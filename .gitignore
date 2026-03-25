@@ -1,6 +1,14 @@
-*.o
+# Build artifacts
 astar
-.vscode/
-*.zip
+astar_asan
+*.o
+
+# Generated outputs
+se2_waypoints.txt
 controls.txt
-plan_viz.png
+
+# IDE
+.vscode/
+
+# Archives
+*.zip

@@ -24,11 +24,11 @@ for query in "$GALLERY_DIR"/*.cfg; do
     total=$((total + 1))
     printf "  %-30s " "$name"
 
-    output=$("$BINARY" --config "$GALLERY_CFG" --query "$query" --no-viz 2>&1) || true
+    output=$("$BINARY" --config "$GALLERY_CFG" --query "$query" 2>&1) || true
 
     if echo "$output" | grep -q "^Path found:"; then
         waypoints=$(echo "$output" | grep "^Path found:" | sed 's/.*: \([0-9]*\) waypoints.*/\1/')
-        controls=$(echo "$output" | grep "^Wrote" | sed 's/Wrote \([0-9]*\) controls.*/\1/')
+        controls=$(echo "$output" | grep "^Wrote" | grep "controls" | sed 's/Wrote \([0-9]*\) controls.*/\1/')
         violations=""
         if echo "$output" | grep -q "safety violations"; then
             violations=" [SAFETY VIOLATION]"

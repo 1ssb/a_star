@@ -3,18 +3,21 @@ CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wpedantic
 PYTHON   ?= python3
 TARGET   := astar
 
-.PHONY: all run clean test sanitize
+.PHONY: all run clean test sanitize viz
 
 all: $(TARGET)
 
 $(TARGET): planner.cc
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-# Build, launch visualizer in background, run planner
+# Run planner, then visualize from output files
 run: $(TARGET)
-	@$(PYTHON) visualize.py &
-	@sleep 0.5
 	./astar
+	@$(PYTHON) visualize.py
+
+# Visualize from existing output files
+viz:
+	@$(PYTHON) visualize.py --save-only
 
 # Run all 10 gallery test scenarios
 test: $(TARGET)
@@ -28,7 +31,7 @@ sanitize: planner.cc
 		name=$$(basename "$$q" .cfg); \
 		[ "$$name" = "planner" ] && continue; \
 		printf "  %-30s " "$$name"; \
-		if ./astar_asan --config gallery/planner.cfg --query "$$q" --no-viz 2>&1 | grep -q "^Path found:"; then \
+		if ./astar_asan --config gallery/planner.cfg --query "$$q" 2>&1 | grep -q "^Path found:"; then \
 			echo "CLEAN"; \
 		else \
 			echo "ISSUE"; \
@@ -37,4 +40,4 @@ sanitize: planner.cc
 	@rm -f astar_asan
 
 clean:
-	rm -f $(TARGET) astar_asan plan_viz.png controls.txt
+	rm -f $(TARGET) astar_asan plan_viz.png controls.txt se2_waypoints.txt

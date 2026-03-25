@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-visualize.py — Socket-based visualizer for the SE(2) A* planner.
+visualize.py — File-based visualizer for the SE(2) A* planner.
 
-Listens on a TCP port (default 9876) for a JSON payload from planner,
-then plots waypoints, controller trajectory, and obstacles.
+Reads planner.cfg, query.cfg, se2_waypoints.txt, and controls.txt from disk.
+No sockets — run independently after the planner produces its output files.
 
-Usage:  python3 visualize.py [--port 9876]
+Usage:
+  python3 visualize.py [options]
 
-The planner (./planner) auto-connects and streams results.
+Options:
+  --config <path>      Static config   (default: planner.cfg)
+  --query  <path>      Dynamic config   (default: query.cfg)
+  --waypoints <path>   Waypoints file   (default: se2_waypoints.txt)
+  --controls <path>    Controls file    (default: controls.txt)
+  --out <path>         Output image     (default: plan_viz.png)
+  --save-only          Don't show interactive window
 """
 
-import json
 import math
-import socket
-import struct
 import sys
 
 import matplotlib
@@ -25,36 +29,77 @@ import matplotlib.transforms as mtransforms
 import numpy as np
 
 
-def receive_json(port: int) -> dict:
-    """Listen on TCP port, accept one connection, read length-prefixed JSON."""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", port))
-    srv.listen(1)
-    print(f"Visualizer listening on port {port} ...")
-    conn, addr = srv.accept()
-    print(f"Connected from {addr}")
+def parse_cfg(path: str) -> dict:
+    """Parse a key=value config file (same format as planner.cfg / query.cfg)."""
+    cfg = {}
+    obstacles = {}
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if key.startswith("obs."):
+                parts = key.split(".")
+                if len(parts) == 3:
+                    idx = int(parts[1])
+                    field = parts[2]
+                    if idx not in obstacles:
+                        obstacles[idx] = {}
+                    obstacles[idx][field] = float(val)
+            else:
+                try:
+                    cfg[key] = float(val)
+                except ValueError:
+                    cfg[key] = val
+    # Convert obstacles dict to sorted list
+    if obstacles:
+        max_idx = max(obstacles.keys())
+        obs_list = []
+        for i in range(max_idx + 1):
+            if i in obstacles:
+                ob = obstacles[i]
+                obs_list.append({
+                    "x": ob.get("x", 0.0),
+                    "y": ob.get("y", 0.0),
+                    "theta": ob.get("theta", 0.0),
+                    "length": ob.get("length", 0.35),
+                    "width": ob.get("width", 0.25),
+                })
+        cfg["_obstacles"] = obs_list
+    else:
+        cfg["_obstacles"] = []
+    return cfg
 
-    # Read 4-byte big-endian length
-    raw_len = b""
-    while len(raw_len) < 4:
-        chunk = conn.recv(4 - len(raw_len))
-        if not chunk:
-            raise RuntimeError("Connection closed before length header")
-        raw_len += chunk
-    msg_len = struct.unpack("!I", raw_len)[0]
 
-    # Read message
-    data = b""
-    while len(data) < msg_len:
-        chunk = conn.recv(min(65536, msg_len - len(data)))
-        if not chunk:
-            raise RuntimeError("Connection closed during message")
-        data += chunk
+def load_waypoints(path: str) -> np.ndarray:
+    """Load se2_waypoints.txt: x, y, theta per line."""
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = [float(v) for v in line.replace(",", " ").split()]
+            if len(parts) >= 3:
+                rows.append(parts[:3])
+    return np.array(rows)
 
-    conn.close()
-    srv.close()
-    return json.loads(data.decode("utf-8"))
+
+def load_controls(path: str) -> list:
+    """Load controls.txt: vx, vy, vtheta per line. Duration from config."""
+    ctrls = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = [float(v) for v in line.replace(",", " ").split()]
+            if len(parts) >= 3:
+                ctrls.append(parts[:3])
+    return ctrls
 
 
 def draw_panel(ax, title, cfg, obstacles, wp, robot_r, safety):
@@ -129,14 +174,24 @@ def draw_panel(ax, title, cfg, obstacles, wp, robot_r, safety):
 
 
 def main():
-    port = 9876
+    config_path = "planner.cfg"
+    query_path = "query.cfg"
+    waypoints_path = "se2_waypoints.txt"
+    controls_path = "controls.txt"
     out_file = "plan_viz.png"
     show = True
+
     args = sys.argv[1:]
     i = 0
     while i < len(args):
-        if args[i] == "--port" and i + 1 < len(args):
-            port = int(args[i + 1]); i += 2
+        if args[i] == "--config" and i + 1 < len(args):
+            config_path = args[i + 1]; i += 2
+        elif args[i] == "--query" and i + 1 < len(args):
+            query_path = args[i + 1]; i += 2
+        elif args[i] == "--waypoints" and i + 1 < len(args):
+            waypoints_path = args[i + 1]; i += 2
+        elif args[i] == "--controls" and i + 1 < len(args):
+            controls_path = args[i + 1]; i += 2
         elif args[i] == "--out" and i + 1 < len(args):
             out_file = args[i + 1]; i += 2
         elif args[i] == "--save-only":
@@ -144,16 +199,26 @@ def main():
         else:
             i += 1
 
-    data = receive_json(port)
-
-    cfg = data["config"]
-    obstacles = data["obstacles"]
-    wp = np.array(data["waypoints"])       # [[x, y, theta], ...]
-    ctrls = data["controls"]               # [[vx, vy, vtheta, duration], ...]
+    # Load configs (query overlays planner, same as C++ side)
+    cfg = parse_cfg(config_path)
+    obstacles = cfg.pop("_obstacles", [])
+    query = parse_cfg(query_path)
+    # Query may also define obstacles (gallery test configs)
+    query_obs = query.pop("_obstacles", [])
+    if query_obs:
+        obstacles = query_obs
+    cfg.update(query)
 
     robot_r = cfg["robot_radius"]
     safety = cfg["safety_margin"]
     arrow_len = robot_r * 0.6
+    step_time = cfg.get("step_time", 2.0)
+
+    # Load data files
+    wp = load_waypoints(waypoints_path)
+    raw_ctrls = load_controls(controls_path)
+    # Add duration from config
+    ctrls = [(vx, vy, vth, step_time) for vx, vy, vth in raw_ctrls]
 
     # ── Figure ──
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
@@ -166,7 +231,7 @@ def main():
     # ── Left panel: waypoints ──
     ax1.plot(wp[:, 0], wp[:, 1], "b.-", linewidth=1.2, markersize=6,
              alpha=0.8, label="Path", zorder=3)
-    for i, (x, y, th) in enumerate(wp):
+    for idx, (x, y, th) in enumerate(wp):
         dx = arrow_len * math.cos(th)
         dy = arrow_len * math.sin(th)
         ax1.annotate("", xy=(x + dx, y + dy), xytext=(x, y),
@@ -176,12 +241,11 @@ def main():
                                   edgecolor="cornflowerblue",
                                   linewidth=0.6, linestyle="--", alpha=0.35,
                                   zorder=2))
-        ax1.annotate(str(i), (x, y), textcoords="offset points",
+        ax1.annotate(str(idx), (x, y), textcoords="offset points",
                       xytext=(-6, 6), fontsize=6, color="navy", alpha=0.8)
     ax1.legend(loc="upper left", fontsize=8)
 
     # ── Right panel: controller replay ──
-    # Replay velocity commands: vx * duration = forward displacement
     cx, cy, ct = float(wp[0, 0]), float(wp[0, 1]), float(wp[0, 2])
     traj_x, traj_y = [cx], [cy]
     ctrl_positions = [(cx, cy, ct)]

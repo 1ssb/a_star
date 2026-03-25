@@ -1,36 +1,28 @@
-// planner.cc — Unified SE(2) A* planner + controller + socket visualizer
+// planner.cc — SE(2) A* planner + controller
 //
-// Single file: plans path, generates controls, streams results over TCP
-// socket to visualize.py, and writes controls to controls.txt.
+// Two-phase CLI:
+//   ./astar --plan    → runs A*, writes se2_waypoints.txt
+//   ./astar --gen_control → reads se2_waypoints.txt, writes controls.txt
 //
 // Config split:
-//   planner.cfg  — static settings (map, grid, robot, tolerances)
-//   query.cfg    — dynamic settings (start, goal, obstacles) — updated per run
+//   planner.cfg  — static settings (map, grid, robot, tolerances, obstacles)
+//   query.cfg    — dynamic settings (start, goal) — updated per run
 //
-// Build & run:  make run
-// Build only:   make
+// Build:  make
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
-
-// POSIX sockets
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 // ============================================================
 // SE(2) pose
@@ -90,9 +82,6 @@ struct PlannerConfig
 
     // Controller: time per step (seconds) — controls = displacement / step_time
     double step_time = 2.0;
-
-    // Socket port for visualizer
-    int viz_port = 9876;
 
     void refresh_dtheta() { dtheta = 2.0 * M_PI / n_theta; }
 };
@@ -219,8 +208,6 @@ static bool load_config_file(const std::string &path, PlannerConfig &cfg)
                 cfg.delta_theta = std::stod(val);
             else if (key == "step_time")
                 cfg.step_time = std::stod(val);
-            else if (key == "viz_port")
-                cfg.viz_port = std::stoi(val);
             else if (key.rfind("obs.", 0) == 0)
             {
                 auto dot1 = key.find('.', 4);
@@ -586,15 +573,6 @@ static void apply_offset(std::vector<PathPoint> &path,
 
 // ============================================================
 // Controller: waypoints -> velocity commands
-//
-// Each segment produces (vx, vy, vtheta) as velocities:
-//   vx     = forward speed along heading (m/s)
-//   vy     = lateral speed (always 0, unicycle)
-//   vtheta = angular velocity (rad/s)
-//
-// The robot drives each command for step_time seconds.
-// Displacements are real world-frame distances between waypoints,
-// projected into body frame.
 // ============================================================
 struct ControlCmd
 {
@@ -622,25 +600,18 @@ static std::vector<ControlCmd> compute_controls(
         double dy_w = next.y - prev.y;
         double dtheta = wrap_angle(next.theta - prev.theta);
 
-        // World-frame displacement magnitude
         double dist = hypot2(dx_w, dy_w);
-
-        // Body-frame forward displacement: project onto heading
         double fwd = dx_w * std::cos(prev.theta) + dy_w * std::sin(prev.theta);
-
-        // Use the full Euclidean distance with the sign of the projection
-        // so the robot always covers the real distance
         double displacement = (fwd >= 0.0) ? dist : -dist;
 
         ControlCmd cmd;
-        cmd.vx = displacement / step_time; // m/s
+        cmd.vx = displacement / step_time;
         cmd.vy = 0.0;
-        cmd.vtheta = dtheta / step_time; // rad/s
+        cmd.vtheta = dtheta / step_time;
         cmd.duration = step_time;
         cmds.push_back(cmd);
     }
 
-    // Final in-place rotation to match desired goal heading
     double final_theta = path.back().theta;
     double heading_err = wrap_angle(goal_theta - final_theta);
     if (std::fabs(heading_err) > 1e-6)
@@ -657,7 +628,59 @@ static std::vector<ControlCmd> compute_controls(
 }
 
 // ============================================================
-// Write controls to file (line per command: vx, vy, vtheta)
+// Write SE2 waypoints to file (x, y, theta per line)
+// ============================================================
+static bool write_waypoints_file(const std::vector<PathPoint> &path,
+                                 const std::string &filepath)
+{
+    std::ofstream f(filepath);
+    if (!f)
+    {
+        std::cerr << "ERROR: cannot open " << filepath << " for writing\n";
+        return false;
+    }
+    for (const auto &p : path)
+    {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "%f, %f, %f", p.x, p.y, p.theta);
+        f << buf << "\n";
+    }
+    std::printf("Wrote %zu waypoints to %s\n", path.size(), filepath.c_str());
+    return true;
+}
+
+// ============================================================
+// Read SE2 waypoints from file
+// ============================================================
+static bool read_waypoints_file(const std::string &filepath,
+                                std::vector<PathPoint> &path)
+{
+    std::ifstream f(filepath);
+    if (!f)
+    {
+        std::cerr << "ERROR: cannot open " << filepath << " for reading\n";
+        return false;
+    }
+    std::string line;
+    while (std::getline(f, line))
+    {
+        if (line.empty())
+            continue;
+        // Replace commas with spaces for uniform parsing
+        for (auto &ch : line)
+            if (ch == ',')
+                ch = ' ';
+        std::istringstream iss(line);
+        PathPoint p;
+        if (iss >> p.x >> p.y >> p.theta)
+            path.push_back(p);
+    }
+    std::printf("Read %zu waypoints from %s\n", path.size(), filepath.c_str());
+    return !path.empty();
+}
+
+// ============================================================
+// Write controls to file (vx, vy, vtheta per line)
 // ============================================================
 static bool write_controls_file(const std::vector<ControlCmd> &cmds,
                                 const std::string &path)
@@ -719,194 +742,10 @@ static void audit_path(const std::vector<PathPoint> &path,
 }
 
 // ============================================================
-// Build JSON payload for visualizer socket
+// Print configuration summary
 // ============================================================
-static std::string build_viz_json(const PlannerConfig &cfg,
-                                  const std::vector<PathPoint> &path,
-                                  const std::vector<ControlCmd> &cmds)
+static void print_config(const PlannerConfig &cfg)
 {
-    std::ostringstream js;
-    js.precision(6);
-    js << std::fixed;
-
-    js << "{";
-
-    // Config
-    js << "\"config\":{";
-    js << "\"x_min\":" << cfg.x_min << ",";
-    js << "\"x_max\":" << cfg.x_max << ",";
-    js << "\"y_min\":" << cfg.y_min << ",";
-    js << "\"y_max\":" << cfg.y_max << ",";
-    js << "\"robot_radius\":" << cfg.robot_radius << ",";
-    js << "\"safety_margin\":" << cfg.safety_margin << ",";
-    js << "\"start_x\":" << cfg.start.x << ",";
-    js << "\"start_y\":" << cfg.start.y << ",";
-    js << "\"start_theta\":" << cfg.start.theta << ",";
-    js << "\"goal_x\":" << cfg.goal.x << ",";
-    js << "\"goal_y\":" << cfg.goal.y << ",";
-    js << "\"goal_theta\":" << cfg.goal.theta;
-    js << "},";
-
-    // Obstacles
-    js << "\"obstacles\":[";
-    for (std::size_t i = 0; i < cfg.obstacles.size(); ++i)
-    {
-        const auto &ob = cfg.obstacles[i];
-        if (i > 0)
-            js << ",";
-        js << "{\"x\":" << ob.pose.x
-           << ",\"y\":" << ob.pose.y
-           << ",\"theta\":" << ob.pose.theta
-           << ",\"length\":" << ob.length
-           << ",\"width\":" << ob.width << "}";
-    }
-    js << "],";
-
-    // Waypoints
-    js << "\"waypoints\":[";
-    for (std::size_t i = 0; i < path.size(); ++i)
-    {
-        if (i > 0)
-            js << ",";
-        js << "[" << path[i].x << "," << path[i].y << "," << path[i].theta << "]";
-    }
-    js << "],";
-
-    // Controls
-    js << "\"controls\":[";
-    for (std::size_t i = 0; i < cmds.size(); ++i)
-    {
-        if (i > 0)
-            js << ",";
-        js << "[" << cmds[i].vx << "," << cmds[i].vy << ","
-           << cmds[i].vtheta << "," << cmds[i].duration << "]";
-    }
-    js << "]";
-
-    js << "}";
-    return js.str();
-}
-
-// ============================================================
-// Send results to visualizer over TCP socket
-// ============================================================
-static bool send_to_visualizer(const std::string &json, int port)
-{
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(port));
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-    // Retry connection a few times (visualizer may still be starting).
-    // Create a fresh socket per attempt — reusing after failed connect is
-    // not portable (fails on macOS).
-    int sock = -1;
-    for (int attempt = 0; attempt < 20; ++attempt)
-    {
-        sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0)
-        {
-            std::perror("socket");
-            return false;
-        }
-        if (connect(sock, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0)
-            break;
-        close(sock);
-        sock = -1;
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    }
-
-    if (sock < 0)
-    {
-        std::cerr << "WARNING: could not connect to visualizer on port " << port << "\n";
-        return false;
-    }
-
-    // Send length-prefixed message: 4 bytes big-endian length + JSON
-    uint32_t len = static_cast<uint32_t>(json.size());
-    uint32_t net_len = htonl(len);
-    ssize_t sent = 0;
-    sent = write(sock, &net_len, 4);
-    if (sent != 4)
-    {
-        close(sock);
-        return false;
-    }
-
-    std::size_t total = 0;
-    while (total < json.size())
-    {
-        sent = write(sock, json.data() + total, json.size() - total);
-        if (sent <= 0)
-        {
-            close(sock);
-            return false;
-        }
-        total += static_cast<std::size_t>(sent);
-    }
-
-    close(sock);
-    std::printf("Sent %zu bytes to visualizer on port %d\n", json.size(), port);
-    return true;
-}
-
-// ============================================================
-// main
-// ============================================================
-int main(int argc, char *argv[])
-{
-    PlannerConfig cfg;
-
-    // Default config file paths (root of workspace)
-    std::string static_cfg = "planner.cfg";
-    std::string dynamic_cfg = "query.cfg";
-    std::string controls_out = "controls.txt";
-    bool do_viz = true;
-
-    // Parse CLI
-    for (int i = 1; i < argc; ++i)
-    {
-        if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc)
-            static_cfg = argv[++i];
-        else if (std::strcmp(argv[i], "--query") == 0 && i + 1 < argc)
-            dynamic_cfg = argv[++i];
-        else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc)
-            controls_out = argv[++i];
-        else if (std::strcmp(argv[i], "--no-viz") == 0)
-            do_viz = false;
-        else if (std::strcmp(argv[i], "-h") == 0 ||
-                 std::strcmp(argv[i], "--help") == 0)
-        {
-            std::printf(
-                "Usage: %s [options]\n"
-                "  --config <path>   Static config  (default: planner.cfg)\n"
-                "  --query  <path>   Dynamic config  (default: query.cfg)\n"
-                "  --output <path>   Controls output (default: controls.txt)\n"
-                "  --no-viz          Skip visualizer socket\n"
-                "  -h, --help        This message\n",
-                argv[0]);
-            return 0;
-        }
-    }
-
-    // Load static config first, then dynamic config overlays
-    std::printf("Loading static config:  %s\n", static_cfg.c_str());
-    if (!load_config_file(static_cfg, cfg))
-    {
-        std::cerr << "ERROR: cannot load static config.\n";
-        return 1;
-    }
-    std::printf("Loading dynamic config: %s\n", dynamic_cfg.c_str());
-    if (!load_config_file(dynamic_cfg, cfg))
-    {
-        std::cerr << "ERROR: cannot load dynamic config.\n";
-        return 1;
-    }
-
-    cfg.start.theta = wrap_angle(cfg.start.theta);
-    cfg.goal.theta = wrap_angle(cfg.goal.theta);
-
-    // Print configuration
     std::printf("\n=== SE(2) A* Planner ===\n");
     std::printf("  Start      : (%.3f, %.3f, %.3f)\n",
                 cfg.start.x, cfg.start.y, cfg.start.theta);
@@ -928,37 +767,144 @@ int main(int argc, char *argv[])
                 cfg.x_min, cfg.x_max, cfg.y_min, cfg.y_max);
     std::printf("  Grid       : dx=%.2f  dy=%.2f  n_theta=%d\n\n",
                 cfg.dx, cfg.dy, cfg.n_theta);
+}
 
-    // ── Plan ──
-    std::vector<PathPoint> path;
-    if (!run_astar(cfg, path))
-        return 1;
-
-    apply_offset(path, cfg);
-    audit_path(path, cfg);
-
-    // ── Controls ──
-    auto cmds = compute_controls(path, cfg.step_time, cfg.goal.theta);
-
-    std::printf("\n=== Controls (%zu commands, step_time=%.1fs) ===\n",
-                cmds.size(), cfg.step_time);
-    std::printf("  %-4s  %10s  %10s  %10s  %8s\n",
-                "Seg", "vx(m/s)", "vy(m/s)", "vth(rad/s)", "dur(s)");
-    for (std::size_t i = 0; i < cmds.size(); ++i)
+// ============================================================
+// Load both config files
+// ============================================================
+static bool load_configs(const std::string &static_cfg,
+                         const std::string &dynamic_cfg,
+                         PlannerConfig &cfg)
+{
+    std::printf("Loading static config:  %s\n", static_cfg.c_str());
+    if (!load_config_file(static_cfg, cfg))
     {
-        std::printf("  %-4zu  %10.4f  %10.4f  %10.4f  %8.1f\n",
-                    i, cmds[i].vx, cmds[i].vy, cmds[i].vtheta, cmds[i].duration);
+        std::cerr << "ERROR: cannot load static config.\n";
+        return false;
+    }
+    std::printf("Loading dynamic config: %s\n", dynamic_cfg.c_str());
+    if (!load_config_file(dynamic_cfg, cfg))
+    {
+        std::cerr << "ERROR: cannot load dynamic config.\n";
+        return false;
+    }
+    cfg.start.theta = wrap_angle(cfg.start.theta);
+    cfg.goal.theta = wrap_angle(cfg.goal.theta);
+    return true;
+}
+
+// ============================================================
+// main
+// ============================================================
+int main(int argc, char *argv[])
+{
+    PlannerConfig cfg;
+
+    std::string static_cfg = "planner.cfg";
+    std::string dynamic_cfg = "query.cfg";
+    std::string waypoints_file = "se2_waypoints.txt";
+    std::string controls_out = "controls.txt";
+
+    enum Mode { MODE_PLAN, MODE_GEN_CONTROL, MODE_BOTH };
+    Mode mode = MODE_BOTH;
+
+    // Parse CLI
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc)
+            static_cfg = argv[++i];
+        else if (std::strcmp(argv[i], "--query") == 0 && i + 1 < argc)
+            dynamic_cfg = argv[++i];
+        else if (std::strcmp(argv[i], "--waypoints") == 0 && i + 1 < argc)
+            waypoints_file = argv[++i];
+        else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc)
+            controls_out = argv[++i];
+        else if (std::strcmp(argv[i], "--plan") == 0)
+            mode = MODE_PLAN;
+        else if (std::strcmp(argv[i], "--gen_control") == 0)
+            mode = MODE_GEN_CONTROL;
+        else if (std::strcmp(argv[i], "-h") == 0 ||
+                 std::strcmp(argv[i], "--help") == 0)
+        {
+            std::printf(
+                "Usage: %s [options]\n"
+                "\n"
+                "Modes (pick one, or omit for both):\n"
+                "  --plan            Run A*, write se2_waypoints.txt\n"
+                "  --gen_control     Read se2_waypoints.txt, write controls.txt\n"
+                "\n"
+                "Options:\n"
+                "  --config <path>     Static config   (default: planner.cfg)\n"
+                "  --query  <path>     Dynamic config   (default: query.cfg)\n"
+                "  --waypoints <path>  Waypoints file   (default: se2_waypoints.txt)\n"
+                "  --output <path>     Controls output  (default: controls.txt)\n"
+                "  -h, --help          This message\n",
+                argv[0]);
+            return 0;
+        }
     }
 
-    // ── Write controls to file ──
-    if (!write_controls_file(cmds, controls_out))
+    if (!load_configs(static_cfg, dynamic_cfg, cfg))
         return 1;
 
-    // ── Visualize ──
-    if (do_viz)
+    print_config(cfg);
+
+    if (mode == MODE_PLAN || mode == MODE_BOTH)
     {
-        std::string json = build_viz_json(cfg, path, cmds);
-        send_to_visualizer(json, cfg.viz_port);
+        // ── Plan ──
+        std::vector<PathPoint> path;
+        if (!run_astar(cfg, path))
+            return 1;
+
+        apply_offset(path, cfg);
+        audit_path(path, cfg);
+
+        if (!write_waypoints_file(path, waypoints_file))
+            return 1;
+
+        if (mode == MODE_PLAN)
+            return 0;
+
+        // Fall through to gen_control in MODE_BOTH
+        auto cmds = compute_controls(path, cfg.step_time, cfg.goal.theta);
+
+        std::printf("\n=== Controls (%zu commands, step_time=%.1fs) ===\n",
+                    cmds.size(), cfg.step_time);
+        std::printf("  %-4s  %10s  %10s  %10s  %8s\n",
+                    "Seg", "vx(m/s)", "vy(m/s)", "vth(rad/s)", "dur(s)");
+        for (std::size_t i = 0; i < cmds.size(); ++i)
+        {
+            std::printf("  %-4zu  %10.4f  %10.4f  %10.4f  %8.1f\n",
+                        i, cmds[i].vx, cmds[i].vy, cmds[i].vtheta, cmds[i].duration);
+        }
+
+        if (!write_controls_file(cmds, controls_out))
+            return 1;
+    }
+    else if (mode == MODE_GEN_CONTROL)
+    {
+        // ── Gen control from existing waypoints ──
+        std::vector<PathPoint> path;
+        if (!read_waypoints_file(waypoints_file, path))
+        {
+            std::cerr << "ERROR: no waypoints loaded from " << waypoints_file << "\n";
+            return 1;
+        }
+
+        auto cmds = compute_controls(path, cfg.step_time, cfg.goal.theta);
+
+        std::printf("\n=== Controls (%zu commands, step_time=%.1fs) ===\n",
+                    cmds.size(), cfg.step_time);
+        std::printf("  %-4s  %10s  %10s  %10s  %8s\n",
+                    "Seg", "vx(m/s)", "vy(m/s)", "vth(rad/s)", "dur(s)");
+        for (std::size_t i = 0; i < cmds.size(); ++i)
+        {
+            std::printf("  %-4zu  %10.4f  %10.4f  %10.4f  %8.1f\n",
+                        i, cmds[i].vx, cmds[i].vy, cmds[i].vtheta, cmds[i].duration);
+        }
+
+        if (!write_controls_file(cmds, controls_out))
+            return 1;
     }
 
     return 0;
