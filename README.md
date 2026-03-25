@@ -2,7 +2,7 @@
 
 Discrete grid-based A* planner over SE(2) (x, y, theta) with velocity controller output. Controls are written line-by-line to `controls.txt`.
 
-![Plan Visualization](plan_viz.png)
+![Plan Visualization](gallery/05_four_obs_dense.png)
 
 ## Prerequisites
 
@@ -60,7 +60,6 @@ Generated at runtime (gitignored):
 ```
 controls.txt             Output: one line per step (vx, vy, vtheta)
 astar                    Compiled binary
-plan_viz.png             Visualization image
 ```
 
 ## Config
