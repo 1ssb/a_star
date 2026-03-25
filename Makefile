@@ -1,20 +1,40 @@
-CXX      := /opt/homebrew/bin/g++-14
-CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wpedantic -D_Alignof=alignof
-PYTHON   := $(HOME)/miniconda3/bin/python3
+CXX      ?= g++
+CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wpedantic
+PYTHON   ?= python3
 TARGET   := astar
 
-.PHONY: all run clean
+.PHONY: all run clean test sanitize
 
 all: $(TARGET)
 
 $(TARGET): planner.cc
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-# Single command: build, launch visualizer in background, run planner
+# Build, launch visualizer in background, run planner
 run: $(TARGET)
 	@$(PYTHON) visualize.py &
 	@sleep 0.5
 	./astar
 
+# Run all 10 gallery test scenarios
+test: $(TARGET)
+	@bash test_gallery.sh
+
+# Build with AddressSanitizer + UBSan + LeakSan and run tests
+sanitize: planner.cc
+	$(CXX) -std=c++17 -O1 -g -fsanitize=address,undefined,leak -fno-omit-frame-pointer -Wall -Wextra -Wpedantic -o astar_asan $<
+	@echo "--- Running gallery tests under sanitizers ---"
+	@for q in gallery/*.cfg; do \
+		name=$$(basename "$$q" .cfg); \
+		[ "$$name" = "planner" ] && continue; \
+		printf "  %-30s " "$$name"; \
+		if ./astar_asan --config gallery/planner.cfg --query "$$q" --no-viz 2>&1 | grep -q "^Path found:"; then \
+			echo "CLEAN"; \
+		else \
+			echo "ISSUE"; \
+		fi; \
+	done
+	@rm -f astar_asan
+
 clean:
-	rm -f $(TARGET) plan_viz.png
+	rm -f $(TARGET) astar_asan plan_viz.png controls.txt

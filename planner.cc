@@ -1,7 +1,7 @@
 // planner.cc — Unified SE(2) A* planner + controller + socket visualizer
 //
 // Single file: plans path, generates controls, streams results over TCP
-// socket to visualize.py, and executes controls via SetMotion().
+// socket to visualize.py, and writes controls to controls.txt.
 //
 // Config split:
 //   planner.cfg  — static settings (map, grid, robot, tolerances)
@@ -48,8 +48,8 @@ struct Pose2D
 struct Obstacle
 {
     Pose2D pose;
-    double length = 0.355;
-    double width = 0.255;
+    double length = 0.35;
+    double width = 0.25;
 };
 
 // ============================================================
@@ -58,9 +58,9 @@ struct Obstacle
 struct PlannerConfig
 {
     // Map bounds (metres)
-    double x_min = -1.0;
+    double x_min = -1.5;
     double x_max = 1.5;
-    double y_min = -1.0;
+    double y_min = -1.5;
     double y_max = 2.75;
 
     // Grid resolution
@@ -73,11 +73,11 @@ struct PlannerConfig
     double goal_tol = 0.35;
 
     // Robot circle radius
-    double robot_radius = 0.25;
+    double robot_radius = 0.5;
 
     // Obstacles
     std::vector<Obstacle> obstacles;
-    double safety_margin = 0.02;
+    double safety_margin = 0.15;
 
     // Poses
     Pose2D start;
@@ -89,7 +89,6 @@ struct PlannerConfig
     double delta_theta = 0.0;
 
     // Controller: time per step (seconds) — controls = displacement / step_time
-    // For Go2: large enough that the robot actually walks the full displacement
     double step_time = 2.0;
 
     // Socket port for visualizer
@@ -304,8 +303,8 @@ struct Grid
     double wy(int yi) const { return y_min + yi * dy; }
     double wt(int ti) const { return ti * dtheta; }
 
-    int to_xi(double x) const { return static_cast<int>(std::round((x - x_min) / dx)); }
-    int to_yi(double y) const { return static_cast<int>(std::round((y - y_min) / dy)); }
+    int to_xi(double x) const { return static_cast<int>(std::floor((x - x_min) / dx + 0.5 + 1e-9)); }
+    int to_yi(double y) const { return static_cast<int>(std::floor((y - y_min) / dy + 0.5 + 1e-9)); }
     int to_ti(double theta) const
     {
         double t = wrap_angle(theta);
@@ -586,7 +585,7 @@ static void apply_offset(std::vector<PathPoint> &path,
 }
 
 // ============================================================
-// Controller: waypoints -> velocity commands for Go2
+// Controller: waypoints -> velocity commands
 //
 // Each segment produces (vx, vy, vtheta) as velocities:
 //   vx     = forward speed along heading (m/s)
@@ -595,8 +594,7 @@ static void apply_offset(std::vector<PathPoint> &path,
 //
 // The robot drives each command for step_time seconds.
 // Displacements are real world-frame distances between waypoints,
-// projected into body frame. This ensures the Go2 actually walks
-// to each waypoint rather than making micro-adjustments.
+// projected into body frame.
 // ============================================================
 struct ControlCmd
 {
@@ -608,7 +606,8 @@ struct ControlCmd
 
 static std::vector<ControlCmd> compute_controls(
     const std::vector<PathPoint> &path,
-    double step_time)
+    double step_time,
+    double goal_theta)
 {
     std::vector<ControlCmd> cmds;
     if (path.size() < 2)
@@ -640,37 +639,43 @@ static std::vector<ControlCmd> compute_controls(
         cmd.duration = step_time;
         cmds.push_back(cmd);
     }
+
+    // Final in-place rotation to match desired goal heading
+    double final_theta = path.back().theta;
+    double heading_err = wrap_angle(goal_theta - final_theta);
+    if (std::fabs(heading_err) > 1e-6)
+    {
+        ControlCmd rot;
+        rot.vx = 0.0;
+        rot.vy = 0.0;
+        rot.vtheta = heading_err / step_time;
+        rot.duration = step_time;
+        cmds.push_back(rot);
+    }
+
     return cmds;
 }
 
 // ============================================================
-// SetMotion stub — replace with Go2 SDK call
+// Write controls to file (line per command: vx, vy, vtheta)
 // ============================================================
-static void SetMotion(double vx, double vy, double vtheta)
+static bool write_controls_file(const std::vector<ControlCmd> &cmds,
+                                const std::string &path)
 {
-    std::printf("  SetMotion(vx=%.4f m/s, vy=%.4f m/s, vtheta=%.4f rad/s)\n",
-                vx, vy, vtheta);
-}
-
-// ============================================================
-// Execute controls on Go2
-// ============================================================
-static void execute_controls(const std::vector<ControlCmd> &cmds)
-{
-    std::printf("\n=== Executing %zu control commands ===\n", cmds.size());
-    for (std::size_t i = 0; i < cmds.size(); ++i)
+    std::ofstream f(path);
+    if (!f)
     {
-        const auto &c = cmds[i];
-        std::printf("[step %zu / %zu]  duration=%.1fs\n", i + 1, cmds.size(), c.duration);
-        SetMotion(c.vx, c.vy, c.vtheta);
-
-        // Hold command for duration
-        auto ms = static_cast<int>(c.duration * 1000);
-        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        std::cerr << "ERROR: cannot open " << path << " for writing\n";
+        return false;
     }
-    // Stop
-    std::printf("[done] stopping robot\n");
-    SetMotion(0.0, 0.0, 0.0);
+    for (const auto &c : cmds)
+    {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "%f, %f, %f", c.vx, c.vy, c.vtheta);
+        f << buf << "\n";
+    }
+    std::printf("Wrote %zu controls to %s\n", cmds.size(), path.c_str());
+    return true;
 }
 
 // ============================================================
@@ -787,34 +792,33 @@ static std::string build_viz_json(const PlannerConfig &cfg,
 // ============================================================
 static bool send_to_visualizer(const std::string &json, int port)
 {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
-    {
-        std::perror("socket");
-        return false;
-    }
-
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(port));
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
-    // Retry connection a few times (visualizer may still be starting)
-    bool connected = false;
+    // Retry connection a few times (visualizer may still be starting).
+    // Create a fresh socket per attempt — reusing after failed connect is
+    // not portable (fails on macOS).
+    int sock = -1;
     for (int attempt = 0; attempt < 20; ++attempt)
     {
-        if (connect(sock, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0)
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0)
         {
-            connected = true;
-            break;
+            std::perror("socket");
+            return false;
         }
+        if (connect(sock, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0)
+            break;
+        close(sock);
+        sock = -1;
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
 
-    if (!connected)
+    if (sock < 0)
     {
         std::cerr << "WARNING: could not connect to visualizer on port " << port << "\n";
-        close(sock);
         return false;
     }
 
@@ -856,7 +860,7 @@ int main(int argc, char *argv[])
     // Default config file paths (root of workspace)
     std::string static_cfg = "planner.cfg";
     std::string dynamic_cfg = "query.cfg";
-    bool do_execute = false;
+    std::string controls_out = "controls.txt";
     bool do_viz = true;
 
     // Parse CLI
@@ -866,8 +870,8 @@ int main(int argc, char *argv[])
             static_cfg = argv[++i];
         else if (std::strcmp(argv[i], "--query") == 0 && i + 1 < argc)
             dynamic_cfg = argv[++i];
-        else if (std::strcmp(argv[i], "--execute") == 0)
-            do_execute = true;
+        else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc)
+            controls_out = argv[++i];
         else if (std::strcmp(argv[i], "--no-viz") == 0)
             do_viz = false;
         else if (std::strcmp(argv[i], "-h") == 0 ||
@@ -877,7 +881,7 @@ int main(int argc, char *argv[])
                 "Usage: %s [options]\n"
                 "  --config <path>   Static config  (default: planner.cfg)\n"
                 "  --query  <path>   Dynamic config  (default: query.cfg)\n"
-                "  --execute         Execute controls via SetMotion()\n"
+                "  --output <path>   Controls output (default: controls.txt)\n"
                 "  --no-viz          Skip visualizer socket\n"
                 "  -h, --help        This message\n",
                 argv[0]);
@@ -911,7 +915,7 @@ int main(int argc, char *argv[])
     std::printf("  Robot R    : %.3f m\n", cfg.robot_radius);
     std::printf("  Safety     : %.3f m\n", cfg.safety_margin);
     std::printf("  Inflation  : %.3f m\n", cfg.robot_radius + cfg.safety_margin);
-    std::printf("  Step time  : %.1f s (Go2 velocity commands)\n", cfg.step_time);
+    std::printf("  Step time  : %.1f s\n", cfg.step_time);
     std::printf("  Obstacles  : %zu\n", cfg.obstacles.size());
     for (std::size_t i = 0; i < cfg.obstacles.size(); ++i)
     {
@@ -934,7 +938,7 @@ int main(int argc, char *argv[])
     audit_path(path, cfg);
 
     // ── Controls ──
-    auto cmds = compute_controls(path, cfg.step_time);
+    auto cmds = compute_controls(path, cfg.step_time, cfg.goal.theta);
 
     std::printf("\n=== Controls (%zu commands, step_time=%.1fs) ===\n",
                 cmds.size(), cfg.step_time);
@@ -946,17 +950,15 @@ int main(int argc, char *argv[])
                     i, cmds[i].vx, cmds[i].vy, cmds[i].vtheta, cmds[i].duration);
     }
 
+    // ── Write controls to file ──
+    if (!write_controls_file(cmds, controls_out))
+        return 1;
+
     // ── Visualize ──
     if (do_viz)
     {
         std::string json = build_viz_json(cfg, path, cmds);
         send_to_visualizer(json, cfg.viz_port);
-    }
-
-    // ── Execute ──
-    if (do_execute)
-    {
-        execute_controls(cmds);
     }
 
     return 0;

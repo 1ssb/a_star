@@ -157,7 +157,7 @@ def main():
 
     # ── Figure ──
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
-    fig.suptitle("SE(2) A* Planner — Waypoints & Controller (Go2)",
+    fig.suptitle("SE(2) A* Planner — Waypoints & Controller",
                  fontsize=14, fontweight="bold")
 
     draw_panel(ax1, "A* Waypoints", cfg, obstacles, wp, robot_r, safety)
